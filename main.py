@@ -1,319 +1,244 @@
-import os
-import yt_dlp
-from collections import deque
+
+from highrise import BaseBot, __main__, CurrencyItem, Item, Position, AnchorPosition, SessionMetadata, User
+from highrise.__main__ import BotDefinition
+from asyncio import run as arun, Lock
+from json import load, dump
 import asyncio
-import subprocess
-import threading
+import os
+import aiofiles
+from dataclasses import dataclass, asdict
+from typing import Dict, Optional, Tuple, List
+import json
 import time
-import socket
-import signal
-import random
-from dotenv import load_dotenv
-from flask import Flask, request  # تمت إضافة استيراد Flask
 
-app = Flask(__name__)  # تهيئة تطبيق Flask
+@dataclass
+class GameState:
+    board: List[List[str]]
+    current_player: str
+    game_active: bool
+    conversation_id: str
+    last_activity: float
 
-load_dotenv()
+class Bot(BaseBot):
+    def __init__(self):
+        super().__init__()
+        self.games: Dict[str, GameState] = {}
+        self.game_locks: Dict[str, Lock] = {}
+        self.save_lock = Lock()
+        self.save_path = "saved_games.json"
+        self.me = "1_on_1:67b2e6322df65074dacc6bc0:67d16801c9b11edcbb96af0f"
+        self.initialize_games()
+        self.task = None  # تغيير طريقة تعريف المهمة
 
+    async def on_start(self, session_metadata: SessionMetadata) -> None:
+        """يتم استدعاؤها عند بدء تشغيل البوت"""
+        self.task = asyncio.create_task(self.check_inactive_games())
 
-ICECAST_HOST= "link.zeno.fm"
-ICECAST_PORT = "80"
-ICECAST_USER = "source"
-ICECAST_PASSWORD = "tXOQ2HbL"
-ICECAST_MOUNT = "gpo09g38vpkvv"
-ICECAST_URL = f"icecast://{ICECAST_USER}:{ICECAST_PASSWORD}@{ICECAST_HOST}:{ICECAST_PORT}/{ICECAST_MOUNT.strip()}"
-
-SONG_QUEUE = deque()
-current_process = None
-current_song = None
-queue_lock = asyncio.Lock()
-
-@app.route('/health')  # إضافة نقطة نهاية للصحة
-def health_check():
-    return "OK", 200
-
-async def search_ytdlp_async(query, ydl_opts):
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, lambda: _extract(query, ydl_opts))
-
-def _extract(query, ydl_opts):
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        return ydl.extract_info(query, download=False)
-
-async def stream_next_song(loop):
-    global current_process, current_song
-    await asyncio.sleep(0.3)
-
-    async with queue_lock:
-        if current_process is not None:
-            return
-
-        if not SONG_QUEUE:
-            await add_random_song(loop)
-
-        if not SONG_QUEUE:
-            return
-
-        current_song = SONG_QUEUE.popleft()
-        audio_url, title = current_song
-        print(f"البث الآن: {title}")
-
-        ffmpeg_command = [
-            "ffmpeg",
-            "-re",
-            "-i", audio_url,
-            "-acodec", "libmp3lame",
-            "-ab", "128k",
-            "-f", "mp3",
-            ICECAST_URL
-        ]
-
-        proc = subprocess.Popen(ffmpeg_command, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-        current_process = proc
-
-        def wait_and_continue():
-            global current_process, current_song
-            proc.wait()
-            current_process = None
-            current_song = None
-            time.sleep(0.5)
-
-            if not SONG_QUEUE:
-                queries = ["random music", "pop songs", "latest hits", "trending music"]
-                random_query = random.choice(queries)
-                future = asyncio.run_coroutine_threadsafe(
-                    do_play(random_query, loop, immediate=True), loop
-                )
-                try:
-                    response = future.result(timeout=10)
-                    print("إضافة أغنية عشوائية:", response)
-                except Exception as e:
-                    print("فشل إضافة أغنية عشوائية:", e)
-
-            asyncio.run_coroutine_threadsafe(stream_next_song(loop), loop).result()
-
-        threading.Thread(target=wait_and_continue, daemon=True).start()
-
-async def add_random_song(loop):
-    queries = ["random music", "pop songs", "latest hits", "trending music"]
-    random_query = random.choice(queries)
-    response = await do_play(random_query, loop, immediate=True)
-    if "تمت إضافة" not in response:
-        print("فشل إضافة أغنية عشوائية:", response)
-
-async def do_play(song_query: str, loop, immediate=False) -> str:
-    ydl_options = {
-        "format": "bestaudio/best",
-        "postprocessors": [{
-            "key": "FFmpegExtractAudio",
-            "preferredcodec": "mp3",
-            "preferredquality": "192",
-        }],
-        "extractor_args": {"youtube": {"player_client": ["android"]}},
-        "nocheckcertificate": True,
-        "ignoreerrors": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
-
-    try:
-        query = "ytsearch1:" + song_query
-        results = await search_ytdlp_async(query, ydl_options)
-        tracks = results.get("entries", [])
-
-        if not tracks:
-            return "لم يتم العثور على نتائج."
-
-        first_track = tracks[0]
-        audio_url = first_track["url"]
-        title = first_track.get("title", "بدون عنوان")
-
-        async with queue_lock:
-            if immediate:
-                SONG_QUEUE.appendleft((audio_url, title))
-            else:
-                SONG_QUEUE.append((audio_url, title))
-
-        response = f"تمت إضافة الأغنية إلى القائمة: {title}"
-
-        if current_process is None:
-            await stream_next_song(loop)
-        elif immediate:
-            current_process.send_signal(signal.SIGINT)
-
-        return response
-    except Exception as e:
-        return f"حدث خطأ أثناء البحث: {str(e)}"
-
-async def do_skip() -> str:
-    global current_process
-    if current_process is not None:
-        current_process.send_signal(signal.SIGINT)
-        return "جارٍ التخطي إلى الأغنية التالية..."
-    return "لا يوجد بث جاري."
-
-async def do_stop() -> str:
-    global current_process, current_song
-    async with queue_lock:
-        if current_process is not None:
-            current_process.kill()
-            current_process = None
-
-        SONG_QUEUE.clear()
-        current_song = None
-    return "تم إيقاف البث ومسح قائمة الانتظار."
-
-async def do_queue() -> str:
-    message = []
-    async with queue_lock:
-        if current_song:
-            message.append(f"الآن يعزف: {current_song[1]}")
-        else:
-            message.append("لا يوجد أغنية تعزف حاليا.")
-
-        if SONG_QUEUE:
-            message.append("\nقائمة الانتظار:")
-            for idx, (url, title) in enumerate(SONG_QUEUE, start=1):
-                message.append(f"{idx}. {title}")
-        else:
-            message.append("\nقائمة الانتظار فارغة.")
-    return "\n".join(message)
-
-async def do_remove(position: int) -> str:
-    async with queue_lock:
-        if position < 1 or position > len(SONG_QUEUE):
-            return "رقم غير صحيح في القائمة."
-
-        removed_song = SONG_QUEUE[position-1]
-        del SONG_QUEUE[position-1]
-        return f"تم حذف الأغنية: {removed_song[1]}"
-
-def terminal_command_listener(loop):
-    print("الاستماع للأوامر من التيرمنل. الردود ستظهر هنا.")
-    while True:
-        try:
-            command = input("أدخل الأمر (play <song> | playnow <song> | skip | stop | queue | remove <num>): ").strip()
-        except EOFError:
-            break
-
-        if command.lower().startswith("playnow "):
-            song_query = command[8:].strip()
-            future = asyncio.run_coroutine_threadsafe(do_play(song_query, loop, immediate=True), loop)
-            response = future.result()
-            print(response)
-        elif command.lower().startswith("play "):
-            song_query = command[5:].strip()
-            future = asyncio.run_coroutine_threadsafe(do_play(song_query, loop), loop)
-            response = future.result()
-            print(response)
-        elif command.lower() == "skip":
-            future = asyncio.run_coroutine_threadsafe(do_skip(), loop)
-            response = future.result()
-            print(response)
-        elif command.lower() == "stop":
-            future = asyncio.run_coroutine_threadsafe(do_stop(), loop)
-            response = future.result()
-            print(response)
-        elif command.lower() == "queue":
-            future = asyncio.run_coroutine_threadsafe(do_queue(), loop)
-            response = future.result()
-            print(response)
-        elif command.lower().startswith("remove "):
+    async def check_inactive_games(self):
+        """التحقق دوريًا من الألعاب غير النشطة"""
+        while True:
             try:
-                position = int(command[7:].strip())
-                future = asyncio.run_coroutine_threadsafe(do_remove(position), loop)
-                response = future.result()
-                print(response)
-            except ValueError:
-                print("الرجاء إدخال رقم صحيح")
+                await asyncio.sleep(30)
+                current_time = time.time()
+                for conv_id in list(self.games.keys()):
+                    game = self.games.get(conv_id)
+                    if game and game.game_active and (current_time - game.last_activity) > 120:
+                        async with self.game_locks.get(conv_id, Lock()):
+                            game.game_active = False
+                            await self.save_games()
+                            await self.highrise.send_message(conv_id, "⏰ تم إنهاء اللعبة بسبب عدم النشاط لأكثر من دقيقتين.")
+            except Exception as e:
+                print(f"Error in check_inactive_games: {str(e)}")
+
+    def initialize_games(self):
+        if os.path.exists(self.save_path):
+            with open(self.save_path, "r") as f:
+                saved_games = load(f) if os.path.getsize(self.save_path) > 0 else []
+            for game_data in saved_games:
+                game = GameState(
+                    board=game_data["board"],
+                    current_player=game_data["current_player"],
+                    game_active=game_data["game_active"],
+                    conversation_id=game_data["conversation_id"],
+                    last_activity=game_data.get("last_activity", time.time())
+                )
+                self.games[game.conversation_id] = game
+                self.game_locks[game.conversation_id] = Lock()
+
+    # بقية الدوال تبقى كما هي بدون تغيير...
+
+    async def save_games(self):
+        async with self.save_lock:
+            saved_games = [asdict(game) for game in self.games.values()]
+            async with aiofiles.open(self.save_path, "w") as f:
+                await f.write(json.dumps(saved_games))
+
+    # ... (الوظائف المساعدة الأخرى تبقى كما هي)
+
+    def num_to_coords(self, num: int) -> Tuple[int, int]:
+        num -= 1
+        return (num // 3, num % 3)
+
+    def format_board(self, board: list) -> str:
+        formatted = []
+        for i, row in enumerate(board):
+            line = []
+            for j, cell in enumerate(row):
+                display = cell if cell != " " else str(i*3 + j + 1)
+                line.append(display)
+            formatted.append(" | ".join(line))
+        return "\n---------\n".join(formatted)
+
+    def check_winner(self, board: list, player: str) -> bool:
+        for i in range(3):
+            if all(board[i][j] == player for j in range(3)): return True
+            if all(board[j][i] == player for j in range(3)): return True
+        if board[0][0] == board[1][1] == board[2][2] == player: return True
+        if board[0][2] == board[1][1] == board[2][0] == player: return True
+        return False
+# ... (الاستيرادات الأخرى تبقى كما هي)
+
+    async def minimax(self, board: list, is_maximizing: bool) -> int:
+        if self.check_winner(board, "O"): return 1
+        if self.check_winner(board, "X"): return -1
+        if all(cell != " " for row in board for cell in row): return 0
+
+        if is_maximizing:
+            best = -float('inf')
+            for i in range(3):
+                for j in range(3):
+                    if board[i][j] == " ":
+                        board[i][j] = "O"
+                        current_score = await self.minimax(board, False)  # أضيف await >
+                        best = max(best, current_score)
+                        board[i][j] = " "
+            return best
         else:
-            print("أمر غير معروف. الأوامر المتاحة: play <song>, playnow <song>, skip, stop, queue, remove <num>.")
+            best = float('inf')
+            for i in range(3):
+                for j in range(3):
+                    if board[i][j] == " ":
+                        board[i][j] = "X"
+                        current_score = await self.minimax(board, True)  # أضيف await ه>
+                        best = min(best, current_score)
+                        board[i][j] = " "
+            return best
 
-def socket_command_listener(loop):
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    s.bind(('localhost', 12345))
-    s.listen(1)
-    print("Socket command listener active on port 12345.")
+    async def ai_move(self, board: list) -> Tuple[int, int]:
+        best_score = -float('inf')
+        best_move = (0, 0)
+        for i in range(3):
+            for j in range(3):
+                if board[i][j] == " ":
+                    board[i][j] = "O"
+                    score = await self.minimax(board, False)  # أضيف await هنا
+                    board[i][j] = " "
+                    if score > best_score:
+                        best_score = score
+                        best_move = (i, j)
+        return best_move
 
-    while True:
-        conn, addr = s.accept()
-        with conn:
-            data = conn.recv(1024)
-            if not data:
-                continue
 
-            command = data.decode().strip()
-            print("Received command:", command)
-
-            if command.lower().startswith("playnow "):
-                song_query = command[8:].strip()
-                future = asyncio.run_coroutine_threadsafe(
-                    do_play(song_query, loop, immediate=True), loop
+    async def handle_game_logic(self, conversation_id: str, message: str) -> str:
+        async with self.game_locks.get(conversation_id, Lock()):
+            if conversation_id not in self.games:
+                self.games[conversation_id] = GameState(
+                    board=[[" " for _ in range(3)] for _ in range(3)],
+                    current_player="X",
+                    game_active=False,
+                    conversation_id=conversation_id,
+                    last_activity=time.time()
                 )
-                response = future.result()
-                conn.sendall(response.encode())
-            elif command.lower().startswith("play "):
-                song_query = command[5:].strip()
-                future = asyncio.run_coroutine_threadsafe(
-                    do_play(song_query, loop), loop
-                )
-                response = future.result()
-                conn.sendall(response.encode())
-            elif command.lower() == "skip":
-                future = asyncio.run_coroutine_threadsafe(do_skip(), loop)
-                response = future.result()
-                conn.sendall(response.encode())
-            elif command.lower() == "stop":
-                future = asyncio.run_coroutine_threadsafe(do_stop(), loop)
-                response = future.result()
-                conn.sendall(response.encode())
-            elif command.lower() == "queue":
-                future = asyncio.run_coroutine_threadsafe(do_queue(), loop)
-                response = future.result()
-                conn.sendall(response.encode())
-            elif command.lower().startswith("remove "):
-                try:
-                    position = int(command[7:].strip())
-                    future = asyncio.run_coroutine_threadsafe(
-                        do_remove(position), loop
+                self.game_locks[conversation_id] = Lock()
+
+            game = self.games[conversation_id]
+            game.last_activity = time.time()  # تحديث وقت النشاط
+
+            response: str = "❌ حدث خطأ غير متوقع. الرجاء إعادة المحاولة."
+
+        # معالجة أمر الخروج
+            if message.lower() == "exit":
+                game.game_active = False
+                await self.save_games()
+                return "تم إيقاف اللعبة الحالية."
+
+        # معالجة الحالة عندما اللعبة غير نشطة
+            if not game.game_active:
+                if message.lower() in ["start", "ابداء", "بداء", "ابدا"]:
+                    game.board = [[" " for _ in range(3)] for _ in range(3)]
+                    game.current_player = "X"
+                    game.game_active = True
+                    response = (
+                        "🎮 بدأت لعبة جديدة!\n"
+                        f"{self.format_board(game.board)}\n"
+                        "اختر رقمًا بين 1-9:"
                     )
-                    response = future.result()
-                    conn.sendall(response.encode())
-                except ValueError:
-                    conn.sendall("الرجاء إدخال رقم صحيح".encode())
-            else:
-                conn.sendall("أمر غير معروف".encode())
+                else:
+                    response = (
+                        "⚡ لبدء لعبة جديدة اكتب 'start'\n"
+                        "🚫 لإنهاء اللعبة اكتب 'exit'"
+                    )
+                await self.save_games()
+                return response
 
+            # ... (معالجة الأوامر الأساسية تبقى كما هي)
 
+            try:
+                if not message.isdigit():
+                    return "⚠ الرجاء إدخال رقم صحيح بين 1-9!"
 
-def main():
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
+                num = int(message)
+                if not (1 <= num <= 9):
+                    return "🔢 الرقم يجب أن يكون بين 1 و 9!"
 
-    # بدء خادم Flask في thread منفصل (الجزء المصحح)
-    flask_thread = threading.Thread(
-        target=lambda: app.run(
-            host='0.0.0.0',
-            port=int(os.environ.get('PORT', 10000))  # قوس إغلاق هنا
-        ),  # ثم فاصلة
-        daemon=True
-    )
-    flask_thread.start()
+                row, col = self.num_to_coords(num)
+                if game.board[row][col] != " ":
+                    return "⛔ هذا المربع محجوز! اختر رقمًا آخر:"
 
-    terminal_thread = threading.Thread(target=terminal_command_listener, args=(loop,), daemon=True)
-    terminal_thread.start()
+                game.board[row][col] = game.current_player
+                game.last_activity = time.time()  # تحديث النشاط بعد الحركة
 
-    socket_thread = threading.Thread(target=socket_command_listener, args=(loop,), daemon=True)
-    socket_thread.start()
+                if self.check_winner(game.board, game.current_player):
+                    game.game_active = False
+                    await self.save_games()
+                    await self.highrise.send_message(slf.me, f"هناك لاعب فاز {conversation_id}")
+                    return f"{self.format_board(game.board)}\n🎉 فاز اللاعب {game.current_player}!"
 
-    try:
-        asyncio.run_coroutine_threadsafe(add_random_song(loop), loop)
-        loop.run_forever()
-    except KeyboardInterrupt:
-        if current_process:
-            current_process.kill()
-        loop.close()
+                if all(cell != " " for row in game.board for cell in row):
+                    game.game_active = False
+                    await self.save_games()
+                    return f"{self.format_board(game.board)}\n🤝 تعادل!"
 
+                if game.current_player == "X":
+                    ai_row, ai_col = await self.ai_move(game.board)
+                    game.board[ai_row][ai_col] = "O"
+                    game.last_activity = time.time()  # تحديث النشاط بعد حركة البوت
 
-if __name__ == "__main__":
-    main()
+                    if self.check_winner(game.board, "O"):
+                        game.game_active = False
+                        await self.save_games()
+                        return f"{self.format_board(game.board)}\nفاز عليك بوت 🤣🤣🫵"
+
+                    game.current_player = "X"
+
+                await self.save_games()
+                return f"{self.format_board(game.board)}\nدورك الان اختار رقم ({game.current_player})  👈 "
+
+            except Exception as e:
+                game.game_active = False
+                await self.save_games()
+                return f"🚨 خطأ حرج: {str(e)}"
+
+# ... (بقية الوظائف تبقى كما هي)
+
+    async def on_message(self, user_id: str, conversation_id: str, is_new_conversation: bool) -> None:
+        try:
+            conversation = await self.highrise.get_messages(conversation_id)
+            message = conversation.messages[0].content
+
+            response = await self.handle_game_logic(conversation_id, message)
+            await self.highrise.send_message(conversation_id, response)
+        except Exception as e:
+            error_msg = f"حدث خطأ في المعالجة: {str(e)}"
+            await self.highrise.send_message(conversation_id, error_msg)
+        
