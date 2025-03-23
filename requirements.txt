@@ -1,0 +1,6 @@
+yt-dlp
+python-dotenv
+ffmpeg-python
+Flask==3.0.2
+websockets
+requests
