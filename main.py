@@ -15,11 +15,12 @@ app = Flask(__name__)  # تهيئة تطبيق Flask
 
 load_dotenv()
 
-ICECAST_HOST = os.getenv("ICECAST_HOST")
-ICECAST_PORT = os.getenv("ICECAST_PORT")
-ICECAST_USER = os.getenv("ICECAST_USER")
-ICECAST_PASSWORD = os.getenv("ICECAST_PASSWORD")
-ICECAST_MOUNT = os.getenv("ICECAST_MOUNT")
+
+ICECAST_HOST= "link.zeno.fm"
+ICECAST_PORT = "80"
+ICECAST_USER = "source"
+ICECAST_PASSWORD = "tXOQ2HbL"
+ICECAST_MOUNT = "gpo09g38vpkvv"
 ICECAST_URL = f"icecast://{ICECAST_USER}:{ICECAST_PASSWORD}@{ICECAST_HOST}:{ICECAST_PORT}/{ICECAST_MOUNT.strip()}"
 
 SONG_QUEUE = deque()
